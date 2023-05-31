@@ -2,31 +2,26 @@ package kai.lu.rocketmq.flink.sink.table;
 
 import kai.lu.rocketmq.flink.legacy.RocketMQConfig;
 import kai.lu.rocketmq.flink.legacy.RocketMQSink;
+import kai.lu.rocketmq.flink.sink.RocketMQRowDataSink;
 import kai.lu.rocketmq.flink.sink.serializer.DynamicRocketMQMessageSerializationSchema;
 import org.apache.flink.api.common.serialization.SerializationSchema;
-import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.connector.ChangelogMode;
-import org.apache.flink.table.connector.Projection;
 import org.apache.flink.table.connector.format.EncodingFormat;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.sink.SinkFunctionProvider;
 import org.apache.flink.table.connector.sink.abilities.SupportsWritingMetadata;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.DataType;
-import org.apache.flink.table.types.utils.DataTypeUtils;
-import org.apache.flink.table.types.utils.LegacyTypeInfoDataTypeConverter;
 
 import javax.annotation.Nullable;
 import java.util.*;
 import java.util.stream.Stream;
 
-import static kai.lu.rocketmq.flink.sink.table.RocketMQRowDataConverter.MetadataConverter;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
- * Defines the dynamic table sink of RocketMQ.
+ * Define dynamic table sink of RocketMQ.
  */
 public class RocketMQDynamicTableSink implements DynamicTableSink, SupportsWritingMetadata {
 
@@ -181,53 +176,5 @@ public class RocketMQDynamicTableSink implements DynamicTableSink, SupportsWriti
         }
 
         return producerProps;
-    }
-
-    // --------------------------------------------------------------------------------------------
-    // Metadata handling
-    // --------------------------------------------------------------------------------------------
-
-    enum WritableMetadata {
-        KEYS(
-                "keys",
-                DataTypes.STRING().nullable(),
-                new MetadataConverter() {
-                    private static final long serialVersionUID = 1L;
-
-                    @Override
-                    public Object read(RowData row, int pos) {
-                        if (row.isNullAt(pos)) {
-                            return null;
-                        }
-                        return row.getString(pos).toString();
-                    }
-                }),
-
-        TAGS(
-                "tags",
-                DataTypes.STRING().nullable(),
-                new MetadataConverter() {
-                    private static final long serialVersionUID = 1L;
-
-                    @Override
-                    public Object read(RowData row, int pos) {
-                        if (row.isNullAt(pos)) {
-                            return null;
-                        }
-                        return row.getString(pos).toString();
-                    }
-                });
-
-        final String key;
-
-        final DataType dataType;
-
-        final MetadataConverter converter;
-
-        WritableMetadata(String key, DataType dataType, MetadataConverter converter) {
-            this.key = key;
-            this.dataType = dataType;
-            this.converter = converter;
-        }
     }
 }

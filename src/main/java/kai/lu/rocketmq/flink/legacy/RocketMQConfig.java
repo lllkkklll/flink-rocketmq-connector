@@ -82,28 +82,6 @@ public class RocketMQConfig {
 
     public static final String WATERMARK = "watermark";
 
-    // Delay message related config
-    public static final String MSG_DELAY_LEVEL = "msg.delay.level";
-    public static final int MSG_DELAY_LEVEL00 = 0; // no delay
-    public static final int MSG_DELAY_LEVEL01 = 1; // 1s
-    public static final int MSG_DELAY_LEVEL02 = 2; // 5s
-    public static final int MSG_DELAY_LEVEL03 = 3; // 10s
-    public static final int MSG_DELAY_LEVEL04 = 4; // 30s
-    public static final int MSG_DELAY_LEVEL05 = 5; // 1min
-    public static final int MSG_DELAY_LEVEL06 = 6; // 2min
-    public static final int MSG_DELAY_LEVEL07 = 7; // 3min
-    public static final int MSG_DELAY_LEVEL08 = 8; // 4min
-    public static final int MSG_DELAY_LEVEL09 = 9; // 5min
-    public static final int MSG_DELAY_LEVEL10 = 10; // 6min
-    public static final int MSG_DELAY_LEVEL11 = 11; // 7min
-    public static final int MSG_DELAY_LEVEL12 = 12; // 8min
-    public static final int MSG_DELAY_LEVEL13 = 13; // 9min
-    public static final int MSG_DELAY_LEVEL14 = 14; // 10min
-    public static final int MSG_DELAY_LEVEL15 = 15; // 20min
-    public static final int MSG_DELAY_LEVEL16 = 16; // 30min
-    public static final int MSG_DELAY_LEVEL17 = 17; // 1h
-    public static final int MSG_DELAY_LEVEL18 = 18; // 2h
-
     /**
      * Build Producer Configs.
      *

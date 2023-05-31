@@ -1,11 +1,11 @@
-package kai.lu.rocketmq.flink.common;
+package kai.lu.rocketmq.flink.options;
 
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
 
 import static kai.lu.rocketmq.flink.legacy.RocketMQConfig.*;
 
-public class RocketMQOptions {
+public class RocketMQConnectorOptions {
 
     public static final ConfigOption<String> NAME_SERVER_ADDRESS = ConfigOptions
             .key("nameServerAddress")
@@ -97,48 +97,6 @@ public class RocketMQOptions {
             .defaultValue(30000L)
             .withDescription("Partition Discovery Interval(Ms).");
 
-    public static final ConfigOption<Boolean> OPTIONAL_USE_NEW_API = ConfigOptions
-            .key("useNewApi")
-            .booleanType()
-            .defaultValue(true)
-            .withDescription("Whether use new Api.");
-
-    public static final ConfigOption<Integer> OPTIONAL_WRITE_RETRY_TIMES = ConfigOptions
-            .key("retryTimes")
-            .intType()
-            .defaultValue(10)
-            .withDescription("Retry times when it occurs exception or error.");
-
-    public static final ConfigOption<Long> OPTIONAL_WRITE_SLEEP_TIME_MS = ConfigOptions
-            .key("sleepTimeMs")
-            .longType()
-            .defaultValue(5000L)
-            .withDescription("Sleep time(Ms), default value is 5000.");
-
-    public static final ConfigOption<Boolean> OPTIONAL_WRITE_IS_DYNAMIC_TAG = ConfigOptions
-            .key("isDynamicTag")
-            .booleanType()
-            .defaultValue(false)
-            .withDescription("Whether dynamic tag.");
-
-    public static final ConfigOption<String> OPTIONAL_WRITE_DYNAMIC_TAG_COLUMN = ConfigOptions
-            .key("dynamicTagColumn")
-            .stringType()
-            .noDefaultValue()
-            .withDescription("Dynamic tag column.");
-
-    public static final ConfigOption<Boolean> OPTIONAL_WRITE_DYNAMIC_TAG_COLUMN_WRITE_INCLUDED = ConfigOptions
-            .key("dynamicTagColumnWriteIncluded")
-            .booleanType()
-            .defaultValue(true)
-            .withDescription("Whether write including dynamic tag column.");
-
-    public static final ConfigOption<String> OPTIONAL_WRITE_KEY_COLUMNS = ConfigOptions
-            .key("keyColumns")
-            .stringType()
-            .noDefaultValue()
-            .withDescription("Key Columns, split by ','.");
-
     public static final ConfigOption<Boolean> OPTIONAL_WRITE_KEYS_TO_BODY = ConfigOptions
             .key("writeKeysToBody")
             .booleanType()
@@ -156,29 +114,4 @@ public class RocketMQOptions {
             .stringType()
             .noDefaultValue()
             .withDescription("Secret Key.");
-
-    public static final ConfigOption<String> ENCODING = ConfigOptions
-            .key("encoding".toLowerCase())
-            .stringType()
-            .defaultValue("UTF-8");
-
-    public static final ConfigOption<String> FIELD_DELIMITER = ConfigOptions
-            .key("fieldDelimiter".toLowerCase())
-            .stringType()
-            .defaultValue("\u0001");
-
-    public static final ConfigOption<String> LINE_DELIMITER = ConfigOptions
-            .key("lineDelimiter".toLowerCase())
-            .stringType()
-            .defaultValue("\n");
-
-    public static final ConfigOption<Boolean> COLUMN_ERROR_DEBUG = ConfigOptions
-            .key("columnErrorDebug".toLowerCase())
-            .booleanType()
-            .defaultValue(true);
-
-    public static final ConfigOption<String> LENGTH_CHECK = ConfigOptions
-            .key("lengthCheck".toLowerCase())
-            .stringType()
-            .defaultValue("NONE");
 }

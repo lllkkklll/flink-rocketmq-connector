@@ -1,4 +1,4 @@
-package kai.lu.rocketmq.flink.sink.table;
+package kai.lu.rocketmq.flink.sink;
 
 import kai.lu.rocketmq.flink.sink.serializer.DynamicRocketMQMessageSerializationSchema;
 import org.apache.rocketmq.common.message.Message;
