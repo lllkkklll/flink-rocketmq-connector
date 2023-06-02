@@ -8,12 +8,16 @@ import org.apache.flink.util.Collector;
 import org.apache.rocketmq.common.message.MessageExt;
 
 import java.io.IOException;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A row data wrapper class that wraps a {@link RocketMQDeserializationSchema} to deserialize {@link
  * MessageExt}.
  */
-public class DynamicRocketMQDeserializationSchema implements RocketMQDeserializationSchema<RowData> {
+public class DynamicRocketMQDeserializationSchema
+        implements RocketMQDeserializationSchema<RowData> {
 
     private static final long serialVersionUID = 1L;
 
@@ -46,5 +50,30 @@ public class DynamicRocketMQDeserializationSchema implements RocketMQDeserializa
     @Override
     public TypeInformation<RowData> getProducedType() {
         return producedTypeInfo;
+    }
+
+    // --------------------------------------------------------------------------------------------
+
+    public interface MetadataConverter extends Serializable {
+        Object read(MessageExt message);
+    }
+
+    // --------------------------------------------------------------------------------------------
+
+    private static final class BufferingCollector implements Collector<RowData>, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        private final List<RowData> buffer = new ArrayList<>();
+
+        @Override
+        public void collect(RowData record) {
+            buffer.add(record);
+        }
+
+        @Override
+        public void close() {
+            // nothing to do
+        }
     }
 }

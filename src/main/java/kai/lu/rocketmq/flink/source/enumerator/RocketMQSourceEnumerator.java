@@ -1,13 +1,12 @@
 package kai.lu.rocketmq.flink.source.enumerator;
 
+import kai.lu.rocketmq.flink.option.RocketMQConnectorOptions;
 import kai.lu.rocketmq.flink.source.split.RocketMQPartitionSplit;
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.api.connector.source.SplitsAssignment;
-import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.StringUtils;
 import org.apache.rocketmq.acl.common.AclClientRPCHook;
@@ -24,19 +23,16 @@ import javax.annotation.Nullable;
 import java.lang.management.ManagementFactory;
 import java.util.*;
 
-import static kai.lu.rocketmq.flink.legacy.RocketMQConfig.*;
-
 /**
  * The enumerator class for RocketMQ source.
  */
 @Internal
-public class RocketMQSourceEnumerator implements SplitEnumerator<RocketMQPartitionSplit, RocketMQSourceEnumState> {
+public class RocketMQSourceEnumerator
+        implements SplitEnumerator<RocketMQPartitionSplit, RocketMQSourceEnumState> {
 
     private static final Logger LOG = LoggerFactory.getLogger(RocketMQSourceEnumerator.class);
 
     private final Map<MessageQueue, Long> offsetTable = new HashMap<>();
-    private final String consumerOffsetMode;
-    private final long consumerOffsetTimestamp;
     /**
      * The topic used for this RocketMQSource.
      */
@@ -49,14 +45,6 @@ public class RocketMQSourceEnumerator implements SplitEnumerator<RocketMQPartiti
      * The name server address used for this RocketMQSource.
      */
     private final String nameServerAddress;
-    /**
-     * The stop timestamp for this RocketMQSource.
-     */
-    private final long stopInMs;
-    /**
-     * The start offset for this RocketMQSource.
-     */
-    private final long startOffset;
     /**
      * The partition discovery interval for this RocketMQSource.
      */
@@ -82,7 +70,7 @@ public class RocketMQSourceEnumerator implements SplitEnumerator<RocketMQPartiti
      * This set is only accessed by the partition discovery callable in the callAsync() method, i.e
      * worker thread.
      */
-    private final Set<Tuple3<String, String, Integer>> discoveredPartitions;
+    private final Set<MessageQueue> discoveredPartitions;
     /**
      * The current assignment by reader id. Only accessed by the coordinator thread.
      */
@@ -101,73 +89,71 @@ public class RocketMQSourceEnumerator implements SplitEnumerator<RocketMQPartiti
 
     private boolean noMoreNewPartitionSplits = false;
 
+    private final RocketMQConnectorOptions.ScanStartupMode startupMode;
+
+    private final Map<MessageQueue, Long> specificStartupOffsets;
+
+    private final long startupTimestampMillis;
+
     public RocketMQSourceEnumerator(
             String topic,
-            String consumerGroup,
             String nameServerAddress,
+            String consumerGroup,
             String accessKey,
             String secretKey,
-            long stopInMs,
-            long startOffset,
             long partitionDiscoveryIntervalMs,
             Boundedness boundedness,
-            SplitEnumeratorContext<RocketMQPartitionSplit> context,
-            String consumerOffsetMode,
-            long consumerOffsetTimestamp) {
+            RocketMQConnectorOptions.ScanStartupMode startupMode,
+            Map<MessageQueue, Long> specificStartupOffsets,
+            long startupTimestampMillis,
+            SplitEnumeratorContext<RocketMQPartitionSplit> context) {
         this(
                 topic,
-                consumerGroup,
                 nameServerAddress,
+                consumerGroup,
                 accessKey,
                 secretKey,
-                stopInMs,
-                startOffset,
                 partitionDiscoveryIntervalMs,
                 boundedness,
+                startupMode,
+                specificStartupOffsets,
+                startupTimestampMillis,
                 context,
-                new HashMap<>(),
-                consumerOffsetMode,
-                consumerOffsetTimestamp
+                new HashMap<>()
         );
     }
 
     public RocketMQSourceEnumerator(
             String topic,
-            String consumerGroup,
             String nameServerAddress,
+            String consumerGroup,
             String accessKey,
             String secretKey,
-            long stopInMs,
-            long startOffset,
             long partitionDiscoveryIntervalMs,
             Boundedness boundedness,
+            RocketMQConnectorOptions.ScanStartupMode startupMode,
+            Map<MessageQueue, Long> specificStartupOffsets,
+            long startupTimestampMillis,
             SplitEnumeratorContext<RocketMQPartitionSplit> context,
-            Map<Integer, List<RocketMQPartitionSplit>> currentSplitsAssignments,
-            String consumerOffsetMode,
-            long consumerOffsetTimestamp) {
+            Map<Integer, List<RocketMQPartitionSplit>> currentSplitsAssignments) {
         this.topic = topic;
-        this.consumerGroup = consumerGroup;
         this.nameServerAddress = nameServerAddress;
+        this.consumerGroup = consumerGroup;
         this.accessKey = accessKey;
         this.secretKey = secretKey;
-        this.stopInMs = stopInMs;
-        this.startOffset = startOffset;
         this.partitionDiscoveryIntervalMs = partitionDiscoveryIntervalMs;
         this.boundedness = boundedness;
+        this.startupMode = startupMode;
+        this.specificStartupOffsets = specificStartupOffsets;
+        this.startupTimestampMillis = startupTimestampMillis;
         this.context = context;
 
         this.discoveredPartitions = new HashSet<>();
         this.readerIdToSplitAssignments = new HashMap<>(currentSplitsAssignments);
         this.readerIdToSplitAssignments.forEach(
-                (reader, splits) -> splits.forEach(
-                        s -> discoveredPartitions.add(
-                                new Tuple3<>(s.getTopic(), s.getBroker(), s.getPartition())
-                        )
-                )
+                (reader, splits) -> splits.forEach(s -> discoveredPartitions.add(s.getMessageQueue()))
         );
         this.pendingPartitionSplitAssignment = new HashMap<>();
-        this.consumerOffsetMode = consumerOffsetMode;
-        this.consumerOffsetTimestamp = consumerOffsetTimestamp;
     }
 
     /**
@@ -184,20 +170,17 @@ public class RocketMQSourceEnumerator implements SplitEnumerator<RocketMQPartiti
      *       topic name).
      * </ul>
      *
-     * @param topic      the RocketMQ topic assigned.
-     * @param broker     the RocketMQ broker assigned.
-     * @param partition  the RocketMQ partition to assign.
+     * @param messageQueue the RocketMQ MessageQueue.
      * @param numReaders the total number of readers.
      * @return the id of the subtask that owns the split.
      */
-    @VisibleForTesting
-    static int getSplitOwner(String topic, String broker, int partition, int numReaders) {
-        int startIndex = (((topic + "-" + broker).hashCode() * 31) & 0x7FFFFFFF) % numReaders;
+    static int getSplitOwner(MessageQueue messageQueue, int numReaders) {
+        int startIndex = (((messageQueue.getTopic() + "-" + messageQueue.getBrokerName()).hashCode() * 31) & 0x7FFFFFFF) % numReaders;
 
         // here, the assumption is that the id of RocketMQ partitions are always ascending
         // starting from 0, and therefore can be used directly as the offset clockwise from the
         // start index
-        return (startIndex + partition) % numReaders;
+        return (startIndex + messageQueue.getQueueId()) % numReaders;
     }
 
     @Override
@@ -259,28 +242,19 @@ public class RocketMQSourceEnumerator implements SplitEnumerator<RocketMQPartiti
     }
 
     private Set<RocketMQPartitionSplit> discoverAndInitializePartitionSplit() throws MQClientException {
-        Set<Tuple3<String, String, Integer>> newPartitions = new HashSet<>();
-        Set<Tuple3<String, String, Integer>> removedPartitions = new HashSet<>(
-                Collections.unmodifiableSet(discoveredPartitions));
+        Set<MessageQueue> newPartitions = new HashSet<>();
+        Set<MessageQueue> removedPartitions = new HashSet<>(Collections.unmodifiableSet(discoveredPartitions));
 
         Collection<MessageQueue> messageQueues = consumer.fetchMessageQueues(topic);
         Set<RocketMQPartitionSplit> result = new HashSet<>();
         consumer.assign(messageQueues);
 
         for (MessageQueue messageQueue : messageQueues) {
-            Tuple3<String, String, Integer> topicPartition = new Tuple3<>(
-                    messageQueue.getTopic(),
-                    messageQueue.getBrokerName(),
-                    messageQueue.getQueueId()
-            );
-            if (!removedPartitions.remove(topicPartition)) {
-                newPartitions.add(topicPartition);
+            if (!removedPartitions.remove(messageQueue)) {
+                newPartitions.add(messageQueue);
                 result.add(new RocketMQPartitionSplit(
-                        topicPartition.f0,
-                        topicPartition.f1,
-                        topicPartition.f2,
-                        getOffsetByMessageQueue(messageQueue),
-                        stopInMs
+                        messageQueue,
+                        getOffsetByMessageQueue(messageQueue)
                 ));
             }
         }
@@ -305,9 +279,7 @@ public class RocketMQSourceEnumerator implements SplitEnumerator<RocketMQPartiti
         int numReaders = context.currentParallelism();
         for (RocketMQPartitionSplit split : newPartitionSplits) {
             int ownerReader = getSplitOwner(
-                    split.getTopic(),
-                    split.getBroker(),
-                    split.getPartition(),
+                    split.getMessageQueue(),
                     numReaders
             );
             pendingPartitionSplitAssignment.computeIfAbsent(ownerReader, r -> new HashSet<>()).add(split);
@@ -362,33 +334,38 @@ public class RocketMQSourceEnumerator implements SplitEnumerator<RocketMQPartiti
     private long getOffsetByMessageQueue(MessageQueue mq) throws MQClientException {
         Long offset = offsetTable.get(mq);
 
-        if (offset == null) {
-            if (startOffset > 0) {
-                offset = startOffset;
-            } else {
-                switch (consumerOffsetMode) {
-                    case CONSUMER_OFFSET_EARLIEST:
-                        offset = mQClientFactory.getMQAdminImpl().minOffset(mq);
-                        break;
-                    case CONSUMER_OFFSET_LATEST:
-                        offset = mQClientFactory.getMQAdminImpl().maxOffset(mq);
-                        break;
-                    case CONSUMER_OFFSET_TIMESTAMP:
-                        offset = consumer.offsetForTimestamp(mq, consumerOffsetTimestamp);
+        switch (startupMode) {
+            case EARLIEST_OFFSET:
+                offset = mQClientFactory.getMQAdminImpl().minOffset(mq);
+                break;
+            case LATEST_OFFSET:
+                offset = mQClientFactory.getMQAdminImpl().maxOffset(mq);
+                break;
+            case GROUP_OFFSETS:
+                offset = consumer.committed(mq);
 
-                        if (offset < 0) {
-                            throw new IllegalArgumentException("Unknown value for CONSUMER_TIMESTAMP: " + consumerOffsetTimestamp + ".");
-                        }
-                        break;
-                    default:
-                        offset = consumer.committed(mq);
-
-                        if (offset < 0) {
-                            throw new IllegalArgumentException("Unknown value for CONSUMER_OFFSET_RESET_TO.");
-                        }
+                if (offset < 0) {
+                    offset = mQClientFactory.getMQAdminImpl().maxOffset(mq);
                 }
-            }
+                break;
+            case SPECIFIC_OFFSETS:
+                MessageQueue messageQueue = new MessageQueue(mq.getTopic(), null, mq.getQueueId());
+
+                offset = specificStartupOffsets.get(messageQueue);
+
+                if (null == offset || offset < 0) {
+                    throw new RuntimeException(mq + " needs to specify offset.");
+                }
+                break;
+            case TIMESTAMP:
+                offset = consumer.offsetForTimestamp(mq, startupTimestampMillis);
+
+                if (offset < 0) {
+                    offset = mQClientFactory.getMQAdminImpl().minOffset(mq);
+                }
+                break;
         }
+
         offsetTable.put(mq, offset);
 
         return offsetTable.get(mq);
@@ -412,7 +389,8 @@ public class RocketMQSourceEnumerator implements SplitEnumerator<RocketMQPartiti
                             "" + System.nanoTime()));
             consumer.start();
 
-            mQClientFactory = MQClientManager.getInstance().getOrCreateMQClientInstance(consumer, aclClientRPCHook);
+            mQClientFactory = MQClientManager.getInstance()
+                    .getOrCreateMQClientInstance(consumer, aclClientRPCHook);
         } catch (MQClientException e) {
             LOG.error("Failed to initial RocketMQ consumer.", e);
             consumer.shutdown();

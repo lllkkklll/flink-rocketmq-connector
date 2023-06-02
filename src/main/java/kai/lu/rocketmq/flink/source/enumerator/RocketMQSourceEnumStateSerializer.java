@@ -12,7 +12,8 @@ import java.util.List;
 import java.util.Map;
 
 /** The {@link SimpleVersionedSerializer Serializer} for the enumerator state of RocketMQ source. */
-public class RocketMQSourceEnumStateSerializer implements SimpleVersionedSerializer<RocketMQSourceEnumState> {
+public class RocketMQSourceEnumStateSerializer
+        implements SimpleVersionedSerializer<RocketMQSourceEnumState> {
 
     private static final int CURRENT_VERSION = 0;
 

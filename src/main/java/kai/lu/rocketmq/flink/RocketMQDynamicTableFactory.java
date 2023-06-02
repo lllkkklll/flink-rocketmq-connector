@@ -1,46 +1,58 @@
 package kai.lu.rocketmq.flink;
 
-import kai.lu.rocketmq.flink.common.RocketMQOptions;
-import kai.lu.rocketmq.flink.sink.table.RocketMQDynamicTableSink;
-import kai.lu.rocketmq.flink.source.table.RocketMQScanTableSource;
-import org.apache.commons.lang3.time.FastDateFormat;
+import kai.lu.rocketmq.flink.sink.RocketMQDynamicTableSink;
+import kai.lu.rocketmq.flink.sink.partitioner.FlinkRocketMQPartitioner;
+import kai.lu.rocketmq.flink.source.RocketMQScanTableSource;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.configuration.ConfigOption;
+import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.connector.base.DeliveryGuarantee;
+import org.apache.flink.table.api.ValidationException;
+import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.connector.format.DecodingFormat;
 import org.apache.flink.table.connector.format.EncodingFormat;
+import org.apache.flink.table.connector.format.Format;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.factories.*;
 import org.apache.flink.table.types.DataType;
-import org.apache.flink.util.Preconditions;
-import org.apache.flink.util.StringUtils;
+import org.apache.flink.types.RowKind;
+import org.apache.rocketmq.common.message.MessageQueue;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.text.ParseException;
+import javax.annotation.Nullable;
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
-import java.util.TimeZone;
 
-import static kai.lu.rocketmq.flink.common.RocketMQOptions.*;
-import static kai.lu.rocketmq.flink.legacy.RocketMQConfig.CONSUMER_OFFSET_LATEST;
+import static kai.lu.rocketmq.flink.option.RocketMQConnectorOptions.*;
+import static kai.lu.rocketmq.flink.option.RocketMQConstant.PROPERTIES_PREFIX;
+import static kai.lu.rocketmq.flink.util.RocketMQConnectorOptionsUtil.*;
 import static org.apache.flink.table.factories.FactoryUtil.createTableFactoryHelper;
 
 /**
- *  flink sql rocketmq connector
- *
- *  This is a common usage of flink sql connector, it implements both TableSource and TableSink.
- *
+ * flink sql rocketmq connector
+ * <p>
+ * This is a common usage of flink sql connector, it implements both TableSource and TableSink.
  */
-public class RocketMQDynamicTableFactory implements DynamicTableSourceFactory, DynamicTableSinkFactory {
+public class RocketMQDynamicTableFactory
+        implements DynamicTableSourceFactory, DynamicTableSinkFactory {
 
+    private static final Logger LOG = LoggerFactory.getLogger(RocketMQDynamicTableFactory.class);
+    private static final ConfigOption<String> SINK_SEMANTIC =
+            ConfigOptions.key("sink.semantic")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Optional semantic when committing.");
     private static final String IDENTIFIER = "rocketmq";
-    private static final String DATE_FORMAT = "yyyy-MM-dd HH:mm:ss";
 
-    private static DecodingFormat<DeserializationSchema<RowData>> getValueDecodingFormat(
+    private static DecodingFormat<DeserializationSchema<RowData>> getDecodingFormat(
             FactoryUtil.TableFactoryHelper helper) {
 
         return helper.discoverOptionalDecodingFormat(
@@ -48,7 +60,7 @@ public class RocketMQDynamicTableFactory implements DynamicTableSourceFactory, D
                 .orElseThrow(() -> new RuntimeException("Not found format."));
     }
 
-    private static EncodingFormat<SerializationSchema<RowData>> getValueEncodingFormat(
+    private static EncodingFormat<SerializationSchema<RowData>> getEncodingFormat(
             FactoryUtil.TableFactoryHelper helper) {
 
         return helper.discoverOptionalEncodingFormat(
@@ -56,146 +68,118 @@ public class RocketMQDynamicTableFactory implements DynamicTableSourceFactory, D
                 .orElseThrow(() -> new RuntimeException("Not found format."));
     }
 
+    private static void validatePKConstraints(
+            ObjectIdentifier tableName,
+            int[] primaryKeyIndexes,
+            Map<String, String> options,
+            Format format) {
+        if (primaryKeyIndexes.length > 0 && format.getChangelogMode().containsOnly(RowKind.INSERT)) {
+            Configuration configuration = Configuration.fromMap(options);
+            String formatName = configuration.getOptional(FactoryUtil.FORMAT)
+                    .orElseThrow(() -> new RuntimeException("Please set format firstly."));
+            throw new ValidationException(
+                    String.format(
+                            "The Kafka table '%s' with '%s' format doesn't support defining PRIMARY KEY constraint"
+                                    + " on the table, because it can't guarantee the semantic of primary key.",
+                            tableName.asSummaryString(), formatName));
+        }
+    }
+
+    private static DeliveryGuarantee validateDeprecatedSemantic(ReadableConfig tableOptions) {
+        if (tableOptions.getOptional(SINK_SEMANTIC).isPresent()) {
+            LOG.warn(
+                    "{} is deprecated and will be removed. Please use {} instead.",
+                    SINK_SEMANTIC.key(),
+                    OPTION_DELIVERY_GUARANTEE.key());
+            return DeliveryGuarantee.valueOf(
+                    tableOptions.get(SINK_SEMANTIC).toUpperCase().replace("-", "_"));
+        }
+        return tableOptions.get(OPTION_DELIVERY_GUARANTEE);
+    }
+
     @Override
     public DynamicTableSource createDynamicTableSource(Context context) {
         FactoryUtil.TableFactoryHelper helper = createTableFactoryHelper(this, context);
 
-        final DecodingFormat<DeserializationSchema<RowData>> valueDecodingFormat = getValueDecodingFormat(helper);
+        final DecodingFormat<DeserializationSchema<RowData>> decodingFormat =
+                getDecodingFormat(helper);
+
+        helper.validateExcept(PROPERTIES_PREFIX);
+
+        final ReadableConfig tableOptions = helper.getOptions();
+
+        validateTableSourceOptions(tableOptions);
+
+        validatePKConstraints(
+                context.getObjectIdentifier(),
+                context.getPrimaryKeyIndexes(),
+                context.getCatalogTable().getOptions(),
+                decodingFormat);
+
+        final StartupOptions startupOptions = getStartupOptions(tableOptions);
+
         final DataType physicalDataType = context.getPhysicalRowDataType();
-
-        helper.validate();
-
-        final Map<String, String> rawProperties = context.getCatalogTable().getOptions();
-        Configuration configuration = Configuration.fromMap(rawProperties);
-        String topic = configuration.getString(TOPIC);
-        String consumerGroup = configuration.getString(GROUP_ID);
-        int consumerTimeout = configuration.getInteger(OPTIONAL_CONSUMER_TIMEOUT);
-        String nameServerAddress = configuration.getString(NAME_SERVER_ADDRESS);
-        String tag = configuration.getString(OPTIONAL_TAG);
-        String sql = configuration.getString(OPTIONAL_SQL);
-
-        if (configuration.contains(OPTIONAL_SCAN_STARTUP_MODE)
-                && (configuration.contains(OPTIONAL_START_MESSAGE_OFFSET)
-                || configuration.contains(OPTIONAL_START_TIME_MILLS)
-                || configuration.contains(OPTIONAL_START_TIME))) {
-            throw new IllegalArgumentException(
-                    String.format(
-                            "cannot support these configs when %s has been set: [%s, %s, %s] !",
-                            OPTIONAL_SCAN_STARTUP_MODE.key(),
-                            OPTIONAL_START_MESSAGE_OFFSET.key(),
-                            OPTIONAL_START_TIME.key(),
-                            OPTIONAL_START_TIME_MILLS.key()));
-        }
-        long startMessageOffset = configuration.getLong(OPTIONAL_START_MESSAGE_OFFSET);
-        long startTimeMs = configuration.getLong(OPTIONAL_START_TIME_MILLS);
-        String startDateTime = configuration.getString(OPTIONAL_START_TIME);
-        String timeZone = configuration.getString(OPTIONAL_TIME_ZONE);
-        String accessKey = configuration.getString(OPTIONAL_ACCESS_KEY);
-        String secretKey = configuration.getString(OPTIONAL_SECRET_KEY);
-        long startTime = startTimeMs;
-        if (startTime == -1) {
-            if (!StringUtils.isNullOrWhitespaceOnly(startDateTime)) {
-                try {
-                    startTime = parseDateString(startDateTime, timeZone);
-                } catch (ParseException e) {
-                    throw new RuntimeException(
-                            String.format(
-                                    "Incorrect datetime format: %s, pls use ISO-8601 "
-                                            + "complete date plus hours, minutes and seconds format:%s.",
-                                    startDateTime, DATE_FORMAT),
-                            e);
-                }
-            }
-        }
-        long stopInMs = Long.MAX_VALUE;
-
-        String endDateTime = configuration.getString(OPTIONAL_END_TIME);
-        if (!StringUtils.isNullOrWhitespaceOnly(endDateTime)) {
-            try {
-                stopInMs = parseDateString(endDateTime, timeZone);
-            } catch (ParseException e) {
-                throw new RuntimeException(
-                        String.format(
-                                "Incorrect datetime format: %s, pls use ISO-8601 "
-                                        + "complete date plus hours, minutes and seconds format:%s.",
-                                endDateTime, DATE_FORMAT),
-                        e);
-            }
-            Preconditions.checkArgument(
-                    stopInMs >= startTime, "Start time should be less than stop time.");
-        }
-        long partitionDiscoveryIntervalMs = configuration.getLong(OPTIONAL_PARTITION_DISCOVERY_INTERVAL_MS);
-        boolean useNewApi = configuration.getBoolean(OPTIONAL_USE_NEW_API);
-
-        String consumerOffsetMode = configuration.getString(
-                RocketMQOptions.OPTIONAL_SCAN_STARTUP_MODE, CONSUMER_OFFSET_LATEST);
-        long consumerOffsetTimestamp = configuration.getLong(
-                RocketMQOptions.OPTIONAL_OFFSET_FROM_TIMESTAMP, System.currentTimeMillis());
 
         return createRocketMQTableSource(
                 physicalDataType,
-                valueDecodingFormat,
-                topic,
-                consumerGroup,
-                consumerTimeout,
-                nameServerAddress,
-                accessKey,
-                secretKey,
-                tag,
-                sql,
-                stopInMs,
-                startMessageOffset,
-                startMessageOffset < 0 ? startTime : -1L,
-                partitionDiscoveryIntervalMs,
-                consumerOffsetMode,
-                consumerOffsetTimestamp,
-                useNewApi,
+                decodingFormat,
+                getTopic(tableOptions),
+                getNameserver(tableOptions),
+                getGroupId(tableOptions),
+                getTag(tableOptions),
+                getAccessKey(tableOptions),
+                getSecretKey(tableOptions),
+                getConsumerTimeout(tableOptions),
+                getPartitionDiscoveryInterval(tableOptions),
+                startupOptions.startupMode,
+                startupOptions.specificOffsets,
+                startupOptions.startupTimestampMillis,
                 context.getObjectIdentifier().asSummaryString());
     }
 
+    // --------------------------------------------------------------------------------------------
+
     @Override
     public DynamicTableSink createDynamicTableSink(Context context) {
-        FactoryUtil.TableFactoryHelper helper = createTableFactoryHelper(this, context);
+        final FactoryUtil.TableFactoryHelper helper =
+                FactoryUtil.createTableFactoryHelper(
+                        this, autoCompleteSchemaRegistrySubject(context));
+
+        final EncodingFormat<SerializationSchema<RowData>> encodingFormat = getEncodingFormat(helper);
 
         final ReadableConfig tableOptions = helper.getOptions();
-        final EncodingFormat<SerializationSchema<RowData>> valueEncodingFormat = getValueEncodingFormat(helper);
+
+        final DeliveryGuarantee deliveryGuarantee = validateDeprecatedSemantic(tableOptions);
+        validateTableSinkOptions(tableOptions);
+
+        validateDeliveryGuarantee(tableOptions);
+
+        validatePKConstraints(
+                context.getObjectIdentifier(),
+                context.getPrimaryKeyIndexes(),
+                context.getCatalogTable().getOptions(),
+                encodingFormat);
+
         final DataType physicalDataType = context.getPhysicalRowDataType();
-        helper.validate();
 
-        Map<String, String> rawProperties = context.getCatalogTable().getOptions();
-        Configuration properties = Configuration.fromMap(rawProperties);
-        String topic = properties.getString(TOPIC);
-        String producerGroup = properties.getString(GROUP_ID);
-        int producerTimeout = properties.getInteger(OPTIONAL_PRODUCER_TIMEOUT);
-        String nameServerAddress = properties.getString(NAME_SERVER_ADDRESS);
-
-        String accessKey = properties.getString(OPTIONAL_ACCESS_KEY);
-        String secretKey = properties.getString(OPTIONAL_SECRET_KEY);
-
-        String tag = properties.getString(OPTIONAL_TAG);
-//        String dynamicColumn = properties.getString(OPTIONAL_WRITE_DYNAMIC_TAG_COLUMN);
-//
-//        boolean writeKeysToBody = properties.getBoolean(OPTIONAL_WRITE_KEYS_TO_BODY);
-//        String keyColumnsConfig = properties.getString(OPTIONAL_WRITE_KEY_COLUMNS);
-//        String[] keyColumns = new String[0];
-//
-//        if (keyColumnsConfig != null && keyColumnsConfig.length() > 0) {
-//            keyColumns = keyColumnsConfig.split(",");
-//        }
-
-        final Integer parallelism = tableOptions.getOptional(FactoryUtil.SINK_PARALLELISM).orElse(null);
+        final Integer parallelism = tableOptions.getOptional(SINK_PARALLELISM).orElse(1);
 
         return createRocketMQTableSink(
                 physicalDataType,
-                valueEncodingFormat,
-                topic,
-                producerGroup,
-                producerTimeout,
-                nameServerAddress,
-                accessKey,
-                secretKey,
-                tag,
-                parallelism
+                encodingFormat,
+                getTopic(tableOptions),
+                getNameserver(tableOptions),
+                getGroupId(tableOptions),
+                getTag(tableOptions),
+                getAccessKey(tableOptions),
+                getSecretKey(tableOptions),
+                tableOptions.get(OPTION_PRODUCER_TIMEOUT),
+                tableOptions.get(OPTION_SINK_BUFFER_FLUSH_MAX_ROWS),
+                tableOptions.get(OPTION_SINK_BUFFER_FLUSH_INTERVAL),
+                getFlinkRocketMQPartitioner(tableOptions, context.getClassLoader()).orElse(null),
+                deliveryGuarantee,
+                parallelism,
+                tableOptions.get(OPTION_TRANSACTIONAL_ID_PREFIX)
         );
     }
 
@@ -206,53 +190,38 @@ public class RocketMQDynamicTableFactory implements DynamicTableSourceFactory, D
 
     @Override
     public Set<ConfigOption<?>> requiredOptions() {
-        Set<ConfigOption<?>> requiredOptions = new HashSet<>();
+        Set<ConfigOption<?>> options = new HashSet<>();
 
-        requiredOptions.add(TOPIC);
-        requiredOptions.add(GROUP_ID);
-        requiredOptions.add(NAME_SERVER_ADDRESS);
+        options.add(OPTION_PROPERTIES_NAMESERVER_ADDRESS);
+        options.add(OPTION_PROPERTIES_TOPIC);
+        options.add(OPTION_PROPERTIES_GROUP_ID);
 
-        return requiredOptions;
+        return options;
     }
 
     @Override
     public Set<ConfigOption<?>> optionalOptions() {
-        Set<ConfigOption<?>> optionalOptions = new HashSet<>();
+        Set<ConfigOption<?>> options = new HashSet<>();
 
-        optionalOptions.add(FactoryUtil.FORMAT);
-        optionalOptions.add(OPTIONAL_TAG);
-        optionalOptions.add(OPTIONAL_SQL);
-        optionalOptions.add(OPTIONAL_START_MESSAGE_OFFSET);
-        optionalOptions.add(OPTIONAL_START_TIME_MILLS);
-        optionalOptions.add(OPTIONAL_START_TIME);
-        optionalOptions.add(OPTIONAL_END_TIME);
-        optionalOptions.add(OPTIONAL_TIME_ZONE);
-        optionalOptions.add(OPTIONAL_PARTITION_DISCOVERY_INTERVAL_MS);
-        optionalOptions.add(OPTIONAL_USE_NEW_API);
-        optionalOptions.add(OPTIONAL_ACCESS_KEY);
-        optionalOptions.add(OPTIONAL_SECRET_KEY);
-        optionalOptions.add(OPTIONAL_SCAN_STARTUP_MODE);
+        options.add(FORMAT);
+        options.add(OPTION_TAG);
+        options.add(OPTION_PARTITION_DISCOVERY_INTERVAL_MS);
+        options.add(OPTION_CONSUMER_TIMEOUT);
+        options.add(OPTION_SCAN_STARTUP_MODE);
+        options.add(OPTION_SCAN_STARTUP_SPECIFIC_OFFSETS);
+        options.add(OPTION_SCAN_STARTUP_TIMESTAMP_MILLIS);
 
-        optionalOptions.add(OPTIONAL_PRODUCER_TIMEOUT);
-        optionalOptions.add(OPTIONAL_CONSUMER_TIMEOUT);
+        options.add(OPTION_PRODUCER_TIMEOUT);
+        options.add(OPTION_SINK_PARTITIONER);
+        options.add(OPTION_SINK_BUFFER_FLUSH_MAX_ROWS);
+        options.add(OPTION_SINK_BUFFER_FLUSH_INTERVAL);
+        options.add(OPTION_DELIVERY_GUARANTEE);
+        options.add(OPTION_TRANSACTIONAL_ID_PREFIX);
 
-        // 写入配置
-        optionalOptions.add(OPTIONAL_WRITE_RETRY_TIMES);
-        optionalOptions.add(OPTIONAL_WRITE_SLEEP_TIME_MS);
-        optionalOptions.add(OPTIONAL_WRITE_IS_DYNAMIC_TAG);
-        optionalOptions.add(OPTIONAL_WRITE_DYNAMIC_TAG_COLUMN);
-        optionalOptions.add(OPTIONAL_WRITE_DYNAMIC_TAG_COLUMN_WRITE_INCLUDED);
-        optionalOptions.add(OPTIONAL_WRITE_KEYS_TO_BODY);
-        optionalOptions.add(OPTIONAL_WRITE_KEY_COLUMNS);
+        options.add(OPTION_ACCESS_KEY);
+        options.add(OPTION_SECRET_KEY);
 
-        // 文件写入格式设置
-        optionalOptions.add(ENCODING);
-        optionalOptions.add(FIELD_DELIMITER);
-        optionalOptions.add(LINE_DELIMITER);
-        optionalOptions.add(COLUMN_ERROR_DEBUG);
-        optionalOptions.add(LENGTH_CHECK);
-
-        return optionalOptions;
+        return options;
     }
 
     // --------------------------------------------------------------------------------------------
@@ -260,39 +229,31 @@ public class RocketMQDynamicTableFactory implements DynamicTableSourceFactory, D
             DataType physicalDataType,
             DecodingFormat<DeserializationSchema<RowData>> valueDecodingFormat,
             String topic,
-            String consumerGroup,
-            int consumerTimeout,
-            String nameServerAddress,
+            String nameserver,
+            String groupId,
+            String tag,
             String accessKey,
             String secretKey,
-            String tag,
-            String sql,
-            long stopInMs,
-            long startMessageOffset,
-            long startTime,
+            int consumerTimeout,
             long partitionDiscoveryIntervalMs,
-            String consumerOffsetMode,
-            long consumerOffsetTimestamp,
-            boolean useNewApi,
+            ScanStartupMode startupMode,
+            Map<MessageQueue, Long> specificStartupOffsets,
+            long startupTimestampMillis,
             String tableIdentifier) {
         return new RocketMQScanTableSource(
                 physicalDataType,
                 valueDecodingFormat,
                 topic,
-                consumerGroup,
-                consumerTimeout,
-                nameServerAddress,
+                nameserver,
+                groupId,
+                tag,
                 accessKey,
                 secretKey,
-                tag,
-                sql,
-                stopInMs,
-                startMessageOffset,
-                startMessageOffset < 0 ? startTime : -1L,
+                consumerTimeout,
                 partitionDiscoveryIntervalMs,
-                consumerOffsetMode,
-                consumerOffsetTimestamp,
-                useNewApi,
+                startupMode,
+                specificStartupOffsets,
+                startupTimestampMillis,
                 tableIdentifier);
     }
 
@@ -300,30 +261,33 @@ public class RocketMQDynamicTableFactory implements DynamicTableSourceFactory, D
             DataType physicalDataType,
             EncodingFormat<SerializationSchema<RowData>> encodingFormat,
             String topic,
-            String producerGroup,
-            long producerTimeout,
             String nameServerAddress,
+            String producerGroup,
+            String tag,
             String accessKey,
             String secretKey,
-            String tag,
-            Integer parallelism) {
+            long producerTimeout,
+            int bufferFlushMaxRows,
+            Duration bufferFlushInterval,
+            FlinkRocketMQPartitioner<RowData> flinkRocketMQPartitioner,
+            DeliveryGuarantee deliveryGuarantee,
+            Integer parallelism,
+            @Nullable String transactionalIdPrefix) {
         return new RocketMQDynamicTableSink(
                 physicalDataType,
                 encodingFormat,
                 topic,
-                producerGroup,
-                producerTimeout,
                 nameServerAddress,
+                producerGroup,
+                tag,
                 accessKey,
                 secretKey,
-                tag,
-                parallelism);
-    }
-
-    private Long parseDateString(String dateString, String timeZone) throws ParseException {
-        FastDateFormat simpleDateFormat = FastDateFormat.getInstance(
-                DATE_FORMAT, TimeZone.getTimeZone(timeZone));
-
-        return simpleDateFormat.parse(dateString).getTime();
+                producerTimeout,
+                bufferFlushMaxRows,
+                bufferFlushInterval,
+                flinkRocketMQPartitioner,
+                deliveryGuarantee,
+                parallelism,
+                transactionalIdPrefix);
     }
 }

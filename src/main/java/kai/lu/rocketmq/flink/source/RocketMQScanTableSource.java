@@ -1,12 +1,12 @@
-package kai.lu.rocketmq.flink.source.table;
+package kai.lu.rocketmq.flink.source;
 
-import kai.lu.rocketmq.flink.source.RocketMQSource;
-import kai.lu.rocketmq.flink.source.reader.deserializer.BytesMessage;
+import kai.lu.rocketmq.flink.option.RocketMQConnectorOptions;
 import kai.lu.rocketmq.flink.source.reader.deserializer.DynamicRocketMQDeserializationSchema;
-import kai.lu.rocketmq.flink.source.reader.deserializer.RowDeserializationSchema.MetadataConverter;
+import kai.lu.rocketmq.flink.source.reader.deserializer.DynamicRocketMQDeserializationSchema.MetadataConverter;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -23,13 +23,12 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.util.Preconditions;
+import org.apache.rocketmq.common.message.MessageExt;
+import org.apache.rocketmq.common.message.MessageQueue;
 
 import javax.annotation.Nullable;
 import java.util.*;
 import java.util.stream.Stream;
-
-import static org.apache.flink.api.connector.source.Boundedness.BOUNDED;
-import static org.apache.flink.api.connector.source.Boundedness.CONTINUOUS_UNBOUNDED;
 
 /**
  * Defines the scan table source of RocketMQ.
@@ -42,24 +41,28 @@ public class RocketMQScanTableSource
     private final DataType physicalDataType;
     private final DecodingFormat<DeserializationSchema<RowData>> valueDecodingFormat;
 
-    private final String consumerOffsetMode;
-    private final long consumerOffsetTimestamp;
-
     private final String topic;
-    private final String consumerGroup;
-    private final int consumerTimeout;
-    private final String nameServerAddress;
+
+    private final String nameserver;
+
+    private final String groupId;
+
     private final String tag;
-    private final String sql;
 
     private final String accessKey;
+
     private final String secretKey;
 
-    private final long stopInMs;
+    private final int consumerTimeout;
+
     private final long partitionDiscoveryIntervalMs;
-    private final long startMessageOffset;
-    private final long startTime;
-    private final boolean useNewApi;
+
+    private final RocketMQConnectorOptions.ScanStartupMode startupMode;
+
+    private final Map<MessageQueue, Long> specificStartupOffsets;
+
+    private final long startupTimestampMillis;
+
     private final String tableIdentifier;
 
     // --------------------------------------------------------------------------------------------
@@ -79,27 +82,23 @@ public class RocketMQScanTableSource
     /**
      * Watermark strategy that is used to generate per-partition watermark.
      */
-    private @Nullable
-    WatermarkStrategy<RowData> watermarkStrategy;
+    @Nullable
+    private WatermarkStrategy<RowData> watermarkStrategy;
 
     public RocketMQScanTableSource(
             DataType physicalDataType,
             DecodingFormat<DeserializationSchema<RowData>> valueDecodingFormat,
             String topic,
-            String consumerGroup,
-            int consumerTimeout,
-            String nameServerAddress,
+            String nameserver,
+            String groupId,
+            String tag,
             String accessKey,
             String secretKey,
-            String tag,
-            String sql,
-            long stopInMs,
-            long startMessageOffset,
-            long startTime,
+            int consumerTimeout,
             long partitionDiscoveryIntervalMs,
-            String consumerOffsetMode,
-            long consumerOffsetTimestamp,
-            boolean useNewApi,
+            RocketMQConnectorOptions.ScanStartupMode startupMode,
+            Map<MessageQueue, Long> specificStartupOffsets,
+            long startupTimestampMillis,
             String tableIdentifier) {
         // Format attributes
         this.physicalDataType =
@@ -109,21 +108,20 @@ public class RocketMQScanTableSource
                 Preconditions.checkNotNull(
                         valueDecodingFormat, "Value decoding format must not be null.");
 
-        this.topic = topic;
-        this.consumerGroup = consumerGroup;
-        this.consumerTimeout = consumerTimeout;
-        this.nameServerAddress = nameServerAddress;
+        this.topic = Preconditions.checkNotNull(topic, "Topic must not be null.");
+        this.nameserver = Preconditions.checkNotNull(nameserver, "Nameserver address must not be null.");
+        this.groupId = Preconditions.checkNotNull(groupId, "Consumer group id must not be null.");
+        this.tag = tag;
         this.accessKey = accessKey;
         this.secretKey = secretKey;
-        this.tag = tag;
-        this.sql = sql;
-        this.stopInMs = stopInMs;
-        this.startMessageOffset = startMessageOffset;
-        this.startTime = startTime;
+        this.consumerTimeout = consumerTimeout;
         this.partitionDiscoveryIntervalMs = partitionDiscoveryIntervalMs;
-        this.useNewApi = useNewApi;
-        this.consumerOffsetMode = consumerOffsetMode;
-        this.consumerOffsetTimestamp = consumerOffsetTimestamp;
+        this.startupMode =
+                Preconditions.checkNotNull(startupMode, "Startup mode must not be null.");
+        this.specificStartupOffsets =
+                Preconditions.checkNotNull(
+                        specificStartupOffsets, "Specific offsets must not be null.");
+        this.startupTimestampMillis = startupTimestampMillis;
         this.tableIdentifier = tableIdentifier;
 
         // Mutable attributes
@@ -142,29 +140,8 @@ public class RocketMQScanTableSource
         final DeserializationSchema<RowData> deserializationSchema = createDeserialization(context, valueDecodingFormat);
         final TypeInformation<RowData> producedTypeInfo = context.createTypeInformation(producedDataType);
 
-        final DynamicRocketMQDeserializationSchema rocketMQDeserializer =
-                new DynamicRocketMQDeserializationSchema(deserializationSchema, producedTypeInfo);
-
-        boolean isBounded = stopInMs != Long.MAX_VALUE;
-
-        RocketMQSource<RowData> rocketMQSource = new RocketMQSource<>(
-                topic,
-                consumerGroup,
-                consumerTimeout,
-                nameServerAddress,
-                accessKey,
-                secretKey,
-                tag,
-                sql,
-                stopInMs,
-                startTime,
-                startMessageOffset < 0 ? 0 : startMessageOffset,
-                partitionDiscoveryIntervalMs,
-                isBounded ? BOUNDED : CONTINUOUS_UNBOUNDED,
-                rocketMQDeserializer,
-                consumerOffsetMode,
-                consumerOffsetTimestamp
-        );
+        final RocketMQSource<RowData> rocketMQSource = createRocketMQSource(
+                deserializationSchema, producedTypeInfo);
 
         return new DataStreamScanProvider() {
             @Override
@@ -181,7 +158,7 @@ public class RocketMQScanTableSource
 
             @Override
             public boolean isBounded() {
-                return isBounded;
+                return rocketMQSource.getBoundedness() == Boundedness.BOUNDED;
             }
         };
     }
@@ -219,20 +196,16 @@ public class RocketMQScanTableSource
                 physicalDataType,
                 valueDecodingFormat,
                 topic,
-                consumerGroup,
-                consumerTimeout,
-                nameServerAddress,
+                nameserver,
+                groupId,
+                tag,
                 accessKey,
                 secretKey,
-                tag,
-                sql,
-                stopInMs,
-                startMessageOffset,
-                startTime,
+                consumerTimeout,
                 partitionDiscoveryIntervalMs,
-                consumerOffsetMode,
-                consumerOffsetTimestamp,
-                useNewApi,
+                startupMode,
+                specificStartupOffsets,
+                startupTimestampMillis,
                 tableIdentifier
         );
         copy.producedDataType = producedDataType;
@@ -258,6 +231,32 @@ public class RocketMQScanTableSource
     }
 
     // --------------------------------------------------------------------------------------------
+
+    protected RocketMQSource<RowData> createRocketMQSource(
+            DeserializationSchema<RowData> deserializationSchema,
+            TypeInformation<RowData> producedTypeInfo) {
+
+        final DynamicRocketMQDeserializationSchema rocketMQDeserializer =
+                new DynamicRocketMQDeserializationSchema(deserializationSchema, producedTypeInfo);
+
+        final RocketMQSourceBuilder<RowData> kafkaSourceBuilder = RocketMQSource.builder();
+
+        return kafkaSourceBuilder.setTopic(topic)
+                .setNameserver(nameserver)
+                .setConsumerGroupId(groupId)
+                .setTag(tag)
+                .setConsumerTimeout(consumerTimeout)
+                .setPartitionDiscoveryIntervalMs(partitionDiscoveryIntervalMs)
+                .setAccessKey(accessKey)
+                .setSecretKey(secretKey)
+                .setStartupMode(startupMode)
+                .setSpecificStartupOffsets(specificStartupOffsets)
+                .setStartupTimestampMillis(startupTimestampMillis)
+                .setDeserializer(rocketMQDeserializer)
+                .build();
+    }
+
+    // --------------------------------------------------------------------------------------------
     // Metadata handling
     // --------------------------------------------------------------------------------------------
 
@@ -269,9 +268,8 @@ public class RocketMQScanTableSource
                     private static final long serialVersionUID = 1L;
 
                     @Override
-                    public Object read(BytesMessage message) {
-                        return StringData.fromString(
-                                String.valueOf(message.getProperty("__topic__")));
+                    public Object read(MessageExt message) {
+                        return StringData.fromString(String.valueOf(message.getTopic()));
                     }
                 });
 

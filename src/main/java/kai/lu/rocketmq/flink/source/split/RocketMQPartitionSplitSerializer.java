@@ -1,6 +1,7 @@
 package kai.lu.rocketmq.flink.source.split;
 
 import org.apache.flink.core.io.SimpleVersionedSerializer;
+import org.apache.rocketmq.common.message.MessageQueue;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -9,7 +10,8 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 
 /** The {@link SimpleVersionedSerializer serializer} for {@link RocketMQPartitionSplit}. */
-public class RocketMQPartitionSplitSerializer implements SimpleVersionedSerializer<RocketMQPartitionSplit> {
+public class RocketMQPartitionSplitSerializer
+        implements SimpleVersionedSerializer<RocketMQPartitionSplit> {
 
     private static final int CURRENT_VERSION = 0;
 
@@ -22,9 +24,11 @@ public class RocketMQPartitionSplitSerializer implements SimpleVersionedSerializ
     public byte[] serialize(RocketMQPartitionSplit split) throws IOException {
         try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
                 DataOutputStream out = new DataOutputStream(baos)) {
-            out.writeUTF(split.getTopic());
-            out.writeUTF(split.getBroker());
-            out.writeInt(split.getPartition());
+
+            MessageQueue messageQueue = split.getMessageQueue();
+            out.writeUTF(messageQueue.getTopic());
+            out.writeUTF(messageQueue.getBrokerName());
+            out.writeInt(messageQueue.getQueueId());
             out.writeLong(split.getStartingOffset());
             out.writeLong(split.getStoppingTimestamp());
             out.flush();
@@ -40,10 +44,13 @@ public class RocketMQPartitionSplitSerializer implements SimpleVersionedSerializ
             String topic = in.readUTF();
             String broker = in.readUTF();
             int partition = in.readInt();
+
+            MessageQueue messageQueue = new MessageQueue(topic, broker, partition);
+
             long offset = in.readLong();
             long timestamp = in.readLong();
 
-            return new RocketMQPartitionSplit(topic, broker, partition, offset, timestamp);
+            return new RocketMQPartitionSplit(messageQueue, offset, timestamp);
         }
     }
 }

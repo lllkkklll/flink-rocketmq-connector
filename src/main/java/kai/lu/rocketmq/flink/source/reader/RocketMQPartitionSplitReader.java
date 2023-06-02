@@ -1,15 +1,9 @@
 package kai.lu.rocketmq.flink.source.reader;
 
-import org.apache.commons.collections.CollectionUtils;
-import org.apache.rocketmq.acl.common.AclClientRPCHook;
-import org.apache.rocketmq.acl.common.SessionCredentials;
-import org.apache.rocketmq.client.consumer.DefaultLitePullConsumer;
-import org.apache.rocketmq.client.exception.MQClientException;
-import org.apache.rocketmq.common.message.MessageExt;
-import org.apache.rocketmq.common.message.MessageQueue;
 import kai.lu.rocketmq.flink.source.reader.deserializer.RocketMQDeserializationSchema;
 import kai.lu.rocketmq.flink.source.split.RocketMQPartitionSplit;
-
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitReader;
@@ -17,24 +11,19 @@ import org.apache.flink.connector.base.source.reader.splitreader.SplitsAddition;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitsChange;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.Preconditions;
-
-import org.apache.commons.lang3.StringUtils;
+import org.apache.rocketmq.acl.common.AclClientRPCHook;
+import org.apache.rocketmq.acl.common.SessionCredentials;
+import org.apache.rocketmq.client.consumer.DefaultLitePullConsumer;
+import org.apache.rocketmq.client.exception.MQClientException;
+import org.apache.rocketmq.common.message.MessageExt;
+import org.apache.rocketmq.common.message.MessageQueue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
-
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 
 /**
  * A {@link SplitReader} implementation that reads records from RocketMQ partitions.
@@ -43,53 +32,36 @@ import java.util.Set;
  */
 public class RocketMQPartitionSplitReader<T>
         implements SplitReader<Tuple3<T, Long, Long>, RocketMQPartitionSplit> {
+
     private static final Logger LOG = LoggerFactory.getLogger(RocketMQPartitionSplitReader.class);
+    private static final int MAX_MESSAGE_NUMBER_PER_BLOCK = 64;
 
     private final String topic;
     private final String tag;
-    private final String sql;
-    private final long stopInMs;
-    private final long startTime;
-    private final long startOffset;
-
     private final int consumerTimeout;
-
     private final RocketMQDeserializationSchema<T> deserializationSchema;
-    private final Map<Tuple3<String, String, Integer>, Long> startingOffsets;
-    private final Map<Tuple3<String, String, Integer>, Long> stoppingTimestamps;
+    private final Map<MessageQueue, Long> startingOffsets;
+
     private final SimpleCollector<T> collector;
-
     private DefaultLitePullConsumer consumer;
-
     private volatile boolean wakeup = false;
-
-    private static final int MAX_MESSAGE_NUMBER_PER_BLOCK = 64;
 
     public RocketMQPartitionSplitReader(
             String topic,
-            String consumerGroup,
-            int consumerTimeout,
             String nameServerAddress,
+            String consumerGroup,
+            String tag,
+            int consumerTimeout,
             String accessKey,
             String secretKey,
-            String tag,
-            String sql,
-            long stopInMs,
-            long startTime,
-            long startOffset,
             RocketMQDeserializationSchema<T> deserializationSchema) {
 
         this.topic = topic;
         this.tag = tag;
-        this.sql = sql;
-        this.stopInMs = stopInMs;
-        this.startTime = startTime;
-        this.startOffset = startOffset;
+        this.consumerTimeout = consumerTimeout;
         this.deserializationSchema = deserializationSchema;
         this.startingOffsets = new HashMap<>();
-        this.stoppingTimestamps = new HashMap<>();
         this.collector = new SimpleCollector<>();
-        this.consumerTimeout = consumerTimeout;
 
         initialRocketMQConsumer(consumerGroup, nameServerAddress, accessKey, secretKey);
     }
@@ -110,38 +82,25 @@ public class RocketMQPartitionSplitReader<T>
         if (CollectionUtils.isNotEmpty(messageExtList)) {
             MessageExt lastMessageExt = messageExtList.get(messageExtList.size() - 1);
 
-            Tuple3<String, String, Integer> topicPartition = new Tuple3<>(
+            MessageQueue messageQueue = new MessageQueue(
                     lastMessageExt.getTopic(),
                     lastMessageExt.getBrokerName(),
-                    lastMessageExt.getQueueId()
-            );
+                    lastMessageExt.getQueueId());
 
-            startingOffsets.put(topicPartition, lastMessageExt.getQueueOffset());
+            startingOffsets.put(messageQueue, lastMessageExt.getQueueOffset());
 
             // 处理数据
             Collection<Tuple3<T, Long, Long>> recordsForSplit = recordsBySplits.recordsForSplit(
                     lastMessageExt.getTopic() + "-" +
                             lastMessageExt.getBrokerName() + "-" +
                             lastMessageExt.getQueueId()
-                    );
+            );
             for (MessageExt messageExt : messageExtList) {
                 if (StringUtils.isNotEmpty(tag) &&
                         StringUtils.isNotEmpty(messageExt.getTags()) &&
                         !messageExt.getTags().equals(tag)) {
 
                     continue;
-                }
-
-                long stoppingTimestamp = getStoppingTimestamp(topicPartition);
-                long storeTimestamp = messageExt.getStoreTimestamp();
-                if (storeTimestamp > stoppingTimestamp) {
-                    finishSplitAtRecord(
-                            topicPartition,
-                            stoppingTimestamp,
-                            messageExt.getQueueOffset(),
-                            recordsBySplits
-                    );
-                    break;
                 }
                 // Add the record to the partition collector.
                 try {
@@ -187,28 +146,12 @@ public class RocketMQPartitionSplitReader<T>
 
         // Set up the stopping timestamps.
         splitsChange.splits()
-                .forEach(split -> {
-                    Tuple3<String, String, Integer> topicPartition = new Tuple3<>(
-                            split.getTopic(),
-                            split.getBroker(),
-                            split.getPartition()
-                    );
-
-                    startingOffsets.put(topicPartition, split.getStartingOffset());
-                    stoppingTimestamps.put(topicPartition, split.getStoppingTimestamp());
-                });
+                .forEach(split -> startingOffsets.put(split.getMessageQueue(), split.getStartingOffset()));
 
         LOG.info("Rocketmq needs to assign queue firstly, queues: " + startingOffsets);
 
-        Map<MessageQueue, Long> queueMap = new HashMap<>();
-        for (Map.Entry<Tuple3<String, String, Integer>, Long> entry : startingOffsets.entrySet()) {
-            Tuple3<String, String, Integer> topicPartition = entry.getKey();
-            MessageQueue messageQueue = new MessageQueue(topicPartition.f0, topicPartition.f1, topicPartition.f2);
-            queueMap.put(messageQueue, entry.getValue());
-        }
-
-        consumer.assign(queueMap.keySet());
-        for (Map.Entry<MessageQueue, Long> entry : queueMap.entrySet()) {
+        consumer.assign(startingOffsets.keySet());
+        for (Map.Entry<MessageQueue, Long> entry : startingOffsets.entrySet()) {
             try {
                 consumer.seek(entry.getKey(), entry.getValue());
             } catch (Exception e) {
@@ -226,23 +169,6 @@ public class RocketMQPartitionSplitReader<T>
     @Override
     public void close() {
         consumer.shutdown();
-    }
-
-    private void finishSplitAtRecord(
-            Tuple3<String, String, Integer> topicPartition,
-            long stoppingTimestamp,
-            long currentOffset,
-            RocketMQPartitionSplitRecords<Tuple3<T, Long, Long>> recordsBySplits) {
-
-        LOG.debug("{} has reached stopping timestamp {}, current offset is {}",
-                topicPartition.f0 + "-" + topicPartition.f1, stoppingTimestamp, currentOffset);
-        recordsBySplits.addFinishedSplit(RocketMQPartitionSplit.toSplitId(topicPartition));
-        startingOffsets.remove(topicPartition);
-        stoppingTimestamps.remove(topicPartition);
-    }
-
-    private long getStoppingTimestamp(Tuple3<String, String, Integer> topicPartition) {
-        return stoppingTimestamps.getOrDefault(topicPartition, stopInMs);
     }
 
     // --------------- private helper method ----------------------
@@ -270,12 +196,6 @@ public class RocketMQPartitionSplitReader<T>
                             consumerGroup,
                             "" + System.nanoTime()));
             consumer.start();
-
-//            if (StringUtils.isNotEmpty(sql)) {
-//                consumer.subscribe(topic, MessageSelector.bySql(sql));
-//            } else {
-//                consumer.subscribe(topic, tag);
-//            }
         } catch (MQClientException e) {
             LOG.error("Failed to initial RocketMQ consumer.", e);
             consumer.shutdown();
@@ -299,10 +219,6 @@ public class RocketMQPartitionSplitReader<T>
 
         private Collection<T> recordsForSplit(String splitId) {
             return recordsBySplits.computeIfAbsent(splitId, id -> new ArrayList<>());
-        }
-
-        private void addFinishedSplit(String splitId) {
-            finishedSplits.add(splitId);
         }
 
         private void prepareForRead() {
@@ -353,7 +269,8 @@ public class RocketMQPartitionSplitReader<T>
         }
 
         @Override
-        public void close() {}
+        public void close() {
+        }
 
         private List<T> getRecords() {
             return records;

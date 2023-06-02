@@ -3,7 +3,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>kai.lu</groupId>
-    <artifactId>flink-sql-rocket-connector</artifactId>
+    <artifactId>flink-sql-connector-rocket</artifactId>
     <version>1.0</version>
 
     <properties>
